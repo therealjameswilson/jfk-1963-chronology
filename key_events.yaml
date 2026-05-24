@@ -1,0 +1,28 @@
+year: 1963
+start_date: 1963-01-01
+end_date: 1963-11-22
+
+days:
+  1963-06-10:
+    label: "American University speech"
+    note: "President Kennedy delivers the commencement address on peace and nuclear arms control."
+  1963-06-11:
+    label: "Civil Rights address"
+    note: "President Kennedy addresses the nation on civil rights."
+  1963-08-05:
+    label: "Nuclear Test Ban Treaty signed"
+    note: "The United States, United Kingdom, and Soviet Union sign the Limited Test Ban Treaty."
+  1963-11-22:
+    label: "Assassination of President Kennedy"
+    note: "President Kennedy is assassinated in Dallas, Texas."
+
+months:
+  1963-06:
+    label: "Kennedy speeches"
+    note: "American University and civil rights addresses."
+  1963-08:
+    label: "Limited Test Ban Treaty"
+    note: "The treaty is signed in Moscow."
+  1963-11:
+    label: "Dallas assassination"
+    note: "The chronology runs through November 22, 1963."

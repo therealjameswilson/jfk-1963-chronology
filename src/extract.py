@@ -1,0 +1,378 @@
+"""Scan the JFK markdown corpus for 1963 date references."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+from concurrent.futures import ProcessPoolExecutor
+from datetime import date
+from pathlib import Path
+from typing import Any, Iterable
+
+try:
+    from .date_patterns import DateHit, HitType, extract_dates
+    from .metadata import (
+        DEFAULT_CORPUS_ROOT,
+        DEFAULT_OUTPUT_PATH as DEFAULT_METADATA_PATH,
+        build_metadata,
+        discover_markdown_files,
+        write_metadata_parquet,
+        write_review_queue,
+    )
+except ImportError:
+    from date_patterns import DateHit, HitType, extract_dates
+    from metadata import (
+        DEFAULT_CORPUS_ROOT,
+        DEFAULT_OUTPUT_PATH as DEFAULT_METADATA_PATH,
+        build_metadata,
+        discover_markdown_files,
+        write_metadata_parquet,
+        write_review_queue,
+    )
+
+
+DEFAULT_OUTPUT_PATH = Path("data/hits.parquet")
+DEFAULT_START_DATE = date(1963, 1, 1)
+DEFAULT_END_DATE = date(1963, 11, 22)
+DEFAULT_CONTEXT_CHARS = 300
+WORD_RE = re.compile(r"\S+")
+
+
+def scan_corpus(
+    corpus_root: Path,
+    metadata_path: Path,
+    output_path: Path,
+    *,
+    start_date: date = DEFAULT_START_DATE,
+    end_date: date = DEFAULT_END_DATE,
+    context_chars: int = DEFAULT_CONTEXT_CHARS,
+    workers: int | None = None,
+) -> list[dict[str, Any]]:
+    """Scan source files and write raw hit rows to parquet."""
+
+    metadata_rows = _load_or_build_metadata(corpus_root, metadata_path)
+    metadata_by_path = {str(row["source_path"]): row for row in metadata_rows}
+    files = discover_markdown_files(corpus_root)
+    worker_count = _worker_count(workers)
+
+    tasks = [
+        (
+            path,
+            corpus_root,
+            metadata_by_path.get(path.relative_to(corpus_root).as_posix(), {}),
+            start_date.isoformat(),
+            end_date.isoformat(),
+            context_chars,
+        )
+        for path in files
+    ]
+    if worker_count == 1:
+        nested_rows = [_scan_file(task) for task in tasks]
+    else:
+        with ProcessPoolExecutor(max_workers=worker_count) as pool:
+            nested_rows = list(pool.map(_scan_file, tasks, chunksize=8))
+
+    rows = [row for file_rows in nested_rows for row in file_rows]
+    rows.sort(
+        key=lambda row: (
+            str(row["bucket"]),
+            str(row["source_path"]),
+            int(row["span_start"]),
+            str(row["matched_text"]),
+        )
+    )
+    write_hits_parquet(rows, output_path)
+    return rows
+
+
+def write_hits_parquet(rows: Iterable[dict[str, Any]], output_path: Path) -> None:
+    """Write hit rows to parquet using pyarrow."""
+
+    pyarrow, parquet = _load_pyarrow()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    table = pyarrow.Table.from_pylist(list(rows), schema=_hit_schema(pyarrow))
+    parquet.write_table(table, output_path)
+
+
+def _scan_file(task: tuple[Path, Path, dict[str, Any], str, str, int]) -> list[dict[str, Any]]:
+    path, corpus_root, metadata, start_raw, end_raw, context_chars = task
+    text = path.read_text(encoding="utf-8", errors="replace")
+    source_path = path.relative_to(corpus_root).as_posix()
+    rows: list[dict[str, Any]] = []
+
+    for hit in extract_dates(text):
+        buckets = _hit_buckets(hit, date.fromisoformat(start_raw), date.fromisoformat(end_raw))
+        if not buckets:
+            continue
+        context_window = _context_window(text, hit.span, context_chars)
+        for bucket in buckets:
+            rows.append(
+                _hit_row(
+                    hit=hit,
+                    bucket=bucket,
+                    context_window=context_window,
+                    source_path=source_path,
+                    filename=path.name,
+                    metadata=metadata,
+                )
+            )
+    return rows
+
+
+def _hit_buckets(
+    hit: DateHit,
+    start_date: date,
+    end_date: date,
+) -> list[dict[str, str | None]]:
+    if hit.hit_type in {HitType.DAY, HitType.RANGE}:
+        buckets = []
+        for raw in hit.dates:
+            parsed = date.fromisoformat(raw)
+            if start_date <= parsed <= end_date:
+                buckets.append(
+                    {
+                        "bucket": raw,
+                        "bucket_type": "day",
+                        "referenced_date": raw,
+                        "referenced_month": raw[:7],
+                        "referenced_quarter": _quarter_for_year_month(
+                            parsed.year, parsed.month
+                        ),
+                    }
+                )
+        return buckets
+
+    if hit.hit_type == HitType.MONTH and hit.month and _month_in_scope(
+        hit.month, start_date, end_date
+    ):
+        year, month = (int(part) for part in hit.month.split("-", maxsplit=1))
+        return [
+            {
+                "bucket": f"month-level/{hit.month}",
+                "bucket_type": "month",
+                "referenced_date": None,
+                "referenced_month": hit.month,
+                "referenced_quarter": _quarter_for_year_month(year, month),
+            }
+        ]
+
+    if hit.hit_type == HitType.QUARTER and hit.quarter_label:
+        quarter = _quarter_from_label(hit.quarter_label, start_date, end_date)
+        if quarter:
+            return [
+                {
+                    "bucket": f"quarter-level/{quarter}",
+                    "bucket_type": "quarter",
+                    "referenced_date": None,
+                    "referenced_month": None,
+                    "referenced_quarter": quarter,
+                }
+            ]
+    return []
+
+
+def _hit_row(
+    *,
+    hit: DateHit,
+    bucket: dict[str, str | None],
+    context_window: str,
+    source_path: str,
+    filename: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    hit_id = _hit_id(source_path, hit, bucket["bucket"])
+    return {
+        "hit_id": hit_id,
+        "source_path": source_path,
+        "filename": filename,
+        "rif_number": metadata.get("rif_number"),
+        "doc_date": metadata.get("doc_date", "unknown"),
+        "originating_agency": metadata.get("originating_agency", "unknown"),
+        "hit_type": hit.hit_type.value,
+        "matched_text": hit.matched_text,
+        "span_start": hit.span[0],
+        "span_end": hit.span[1],
+        "bucket": bucket["bucket"],
+        "bucket_type": bucket["bucket_type"],
+        "referenced_date": bucket["referenced_date"],
+        "referenced_month": bucket["referenced_month"],
+        "referenced_quarter": bucket["referenced_quarter"],
+        "context_window": context_window,
+        "context": context_window,
+        "context_char_count": len(context_window),
+        "context_word_count": len(WORD_RE.findall(context_window)),
+    }
+
+
+def _context_window(text: str, span: tuple[int, int], context_chars: int) -> str:
+    start = max(0, span[0] - context_chars)
+    end = min(len(text), span[1] + context_chars)
+    return text[start:end].strip()
+
+
+def _hit_id(source_path: str, hit: DateHit, bucket: str | None) -> str:
+    raw = f"{source_path}:{hit.span[0]}:{hit.span[1]}:{hit.matched_text}:{bucket}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _month_in_scope(raw: str, start_date: date, end_date: date) -> bool:
+    try:
+        year, month = (int(part) for part in raw.split("-", maxsplit=1))
+        month_start = date(year, month, 1)
+    except ValueError:
+        return False
+    return date(start_date.year, start_date.month, 1) <= month_start <= date(
+        end_date.year, end_date.month, 1
+    )
+
+
+def _quarter_for_year_month(year: int, month: int) -> str:
+    quarter = ((month - 1) // 3) + 1
+    return f"{year}-Q{quarter}"
+
+
+def _quarter_from_label(label: str, start_date: date, end_date: date) -> str | None:
+    lowered = label.lower()
+    year = _label_year_in_scope(label, start_date, end_date)
+    if year is None:
+        return None
+    if "q1" in lowered or "first quarter" in lowered or "winter" in lowered:
+        return f"{year}-Q1"
+    if "q2" in lowered or "second quarter" in lowered or "spring" in lowered:
+        return f"{year}-Q2"
+    if "q3" in lowered or "third quarter" in lowered or "summer" in lowered:
+        return f"{year}-Q3"
+    if "q4" in lowered or "fourth quarter" in lowered or "fall" in lowered:
+        return f"{year}-Q4"
+    if "autumn" in lowered or "late" in lowered:
+        return f"{year}-Q4"
+    if "early" in lowered:
+        return f"{year}-Q1"
+    if "mid" in lowered:
+        return f"{year}-Q2"
+    return None
+
+
+def _label_year_in_scope(label: str, start_date: date, end_date: date) -> int | None:
+    years: list[int] = []
+    for match in re.finditer(r"\b(19\d{2})(?:-(\d{2}))?\b", label):
+        base_year = int(match.group(1))
+        years.append(base_year)
+        if match.group(2):
+            ranged_year = (base_year // 100) * 100 + int(match.group(2))
+            if ranged_year < base_year:
+                ranged_year += 100
+            years.append(ranged_year)
+    for year in years:
+        if start_date.year <= year <= end_date.year:
+            return year
+    return None
+
+
+def _load_or_build_metadata(corpus_root: Path, metadata_path: Path) -> list[dict[str, Any]]:
+    if metadata_path.exists():
+        return _read_parquet(metadata_path)
+
+    rows = build_metadata(corpus_root)
+    write_metadata_parquet(rows, metadata_path)
+    write_review_queue(rows, Path("data/review_queue.jsonl"))
+    return [
+        {
+            "filename": row.filename,
+            "source_path": row.source_path,
+            "rif_number": row.rif_number,
+            "doc_date": row.doc_date,
+            "originating_agency": row.originating_agency,
+        }
+        for row in rows
+    ]
+
+
+def _read_parquet(path: Path) -> list[dict[str, Any]]:
+    _, parquet = _load_pyarrow()
+    table = parquet.read_table(path)
+    return table.to_pylist()
+
+
+def _worker_count(workers: int | None) -> int:
+    if workers is not None:
+        return max(1, workers)
+    cpu_count = os.cpu_count() or 2
+    return max(1, cpu_count - 1)
+
+
+def _hit_schema(pyarrow: Any) -> Any:
+    return pyarrow.schema(
+        [
+            ("hit_id", pyarrow.string()),
+            ("source_path", pyarrow.string()),
+            ("filename", pyarrow.string()),
+            ("rif_number", pyarrow.string()),
+            ("doc_date", pyarrow.string()),
+            ("originating_agency", pyarrow.string()),
+            ("hit_type", pyarrow.string()),
+            ("matched_text", pyarrow.string()),
+            ("span_start", pyarrow.int64()),
+            ("span_end", pyarrow.int64()),
+            ("bucket", pyarrow.string()),
+            ("bucket_type", pyarrow.string()),
+            ("referenced_date", pyarrow.string()),
+            ("referenced_month", pyarrow.string()),
+            ("referenced_quarter", pyarrow.string()),
+            ("context_window", pyarrow.string()),
+            ("context", pyarrow.string()),
+            ("context_char_count", pyarrow.int64()),
+            ("context_word_count", pyarrow.int64()),
+        ]
+    )
+
+
+def _load_pyarrow() -> tuple[Any, Any]:
+    try:
+        import pyarrow  # type: ignore[import-not-found]
+        import pyarrow.parquet as parquet  # type: ignore[import-not-found]
+    except ImportError as exc:
+        msg = (
+            "pyarrow is required to read and write parquet files. Install the "
+            "project dependencies, then rerun this command."
+        )
+        raise SystemExit(msg) from exc
+    return pyarrow, parquet
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS_ROOT)
+    parser.add_argument("--metadata", type=Path, default=DEFAULT_METADATA_PATH)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--context-chars", type=int, default=DEFAULT_CONTEXT_CHARS)
+    parser.add_argument(
+        "--context-words",
+        type=int,
+        dest="context_chars",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--start-date", type=date.fromisoformat, default=DEFAULT_START_DATE)
+    parser.add_argument("--end-date", type=date.fromisoformat, default=DEFAULT_END_DATE)
+    parser.add_argument("--workers", type=int, default=None)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    rows = scan_corpus(
+        corpus_root=args.corpus.resolve(),
+        metadata_path=args.metadata,
+        output_path=args.output,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        context_chars=args.context_chars,
+        workers=args.workers,
+    )
+    print(f"wrote {len(rows)} hit rows to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
